@@ -83,18 +83,7 @@ with base_info as (
                   format
      ),
 
-     app_launch_flg_tbl as (
-         select toString(magnit_id) as magnit_id
-         from dm_nrt.loyalty_events__nrt
-         where 1 = 1
-           and event_date = '{execution_date}'
-           and event_name in (
-             'app_launch'
-             )
-           and magnit_id not in (null, '', 'unknown')
-     ),
-
-
+     -- OPTIMIZATION: Merged app_launch_flg_tbl into delivery_tab_stat to avoid scanning loyalty_events twice
      delivery_tab_stat as (
          select event_date,
                 os_name,
@@ -133,11 +122,8 @@ with base_info as (
                         array_concat_agg(ab)
                 )     as ab_arr,
 
-                if(
-                        magnit_id in app_launch_flg_tbl,
-                        1,
-                        NULL
-                )     as app_launch_flg,
+                -- OPTIMIZATION: Directly calculate app_launch_flg in the same aggregation
+                countIf(event_name = 'app_launch') > 0 as app_launch_flg,
 
                 countIf(
                         event_name in (
@@ -253,8 +239,9 @@ with base_info as (
 
                   from dm_nrt.loyalty_events__nrt
 
+                  -- OPTIMIZATION: Added PREWHERE for better partition pruning
+                  PREWHERE event_date = '{execution_date}'
                   where 1 = 1
-                    and event_date = '{execution_date}'
                     and event_name in (
                                        'app_launch',
                                        'delivery_catalogScreen_view',
@@ -375,6 +362,11 @@ with base_info as (
                                           and money_data_agg.order_type = delivery_tab_stat.delivery_type
      ),
 
+     -- OPTIMIZATION: Materialize magnit_id list to avoid repeated subqueries
+     final_magnit_ids as (
+         select distinct magnit_id
+         from final_data
+     ),
 
      reg_data_info as (
          select magnit_id,
@@ -384,8 +376,8 @@ with base_info as (
                 first_order_dt     as                             first_order_dt_temp,
                 first_order_id_arr as                             first_order_id_arr_temp
          from ft_pa_prod.delivery_magnit_reg_data
-         where 1 = 1
-           and toString(magnit_id) in (select magnit_id from final_data)
+         -- OPTIMIZATION: Use INNER JOIN instead of IN subquery
+         INNER JOIN final_magnit_ids USING (magnit_id)
      ),
      first_order_date as (
 
@@ -393,11 +385,17 @@ with base_info as (
          select magnit_id,
                 first_date
          from ft_growth_prod.di_newbies_costs dnc
-         where 1 = 1
-           and magnit_id in (select magnit_id from final_data)
+         -- OPTIMIZATION: Use INNER JOIN instead of IN subquery
+         INNER JOIN final_magnit_ids USING (magnit_id)
 
 
 
+     ),
+     
+     -- OPTIMIZATION: Materialize fraud users list once
+     fraud_users_list as (
+         select toString(magnit_id) as magnit_id
+         FROM ft_pa_prod.fraud_users
      )
 
 
@@ -468,10 +466,11 @@ from final_data
                            and reg_data_info.delivery_type = final_data.delivery_type
     --and reg_data_info.order_source_version = final_data.order_source_version
          left join
-     first_order_date
-     on first_order_date.magnit_id = final_data.magnit_id
-where final_data.magnit_id not in (select toString(magnit_id) as magnit_id
-FROM ft_pa_prod.fraud_users) --Фродовые юзеры (временная история)
+    first_order_date
+    on first_order_date.magnit_id = final_data.magnit_id
+    -- OPTIMIZATION: Use LEFT ANTI JOIN instead of NOT IN subquery
+    LEFT ANTI JOIN fraud_users_list 
+    ON final_data.magnit_id = fraud_users_list.magnit_id
     SETTINGS connect_timeout = 20000
    , send_timeout = 20000
    , receive_timeout = 20000
